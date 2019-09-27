@@ -747,21 +747,21 @@ var zerobase uintptr
 // nextFreeFast returns the next free object if one is quickly available.
 // Otherwise it returns 0.
 func nextFreeFast(s *mspan) gclinkptr {
-	theBit := sys.Ctz64(s.allocCache) // Is there a free object in the allocCache?
+	theBit := sys.Ctz64(s.allocCache) // 從低位開始計算 allocCache 有幾個 0
 	if theBit < 64 {
 		result := s.freeindex + uintptr(theBit)
-		if result < s.nelems {
+		if result < s.nelems { // 若找出來的 bit 還在該 mspan 可用的範圍內，便可直接使用
 			freeidx := result + 1
 			if freeidx%64 == 0 && freeidx != s.nelems {
 				return 0
 			}
-			s.allocCache >>= uint(theBit + 1)
-			s.freeindex = freeidx
+			s.allocCache >>= uint(theBit + 1) // 調整 allocCache，因為此次會用掉一個 object，所以 +1
+			s.freeindex = freeidx             // 調整 freeindex
 			s.allocCount++
 			return gclinkptr(result*s.elemsize + s.base())
 		}
 	}
-	return 0
+	return 0 // 若無法找到可用的 object，便回傳 0 讓外面處理
 }
 
 // nextFree returns the next free object from the cached span if one is available.
@@ -776,25 +776,25 @@ func nextFreeFast(s *mspan) gclinkptr {
 func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bool) {
 	s = c.alloc[spc]
 	shouldhelpgc = false
-	freeIndex := s.nextFreeIndex()
+	freeIndex := s.nextFreeIndex() // 找出下個可用的 freeIndex
 	if freeIndex == s.nelems {
 		// The span is full.
-		if uintptr(s.allocCount) != s.nelems {
+		if uintptr(s.allocCount) != s.nelems { // 若 nextFreeIndex 回傳 nelems 代表該 mspan 已無可用的 object
 			println("runtime: s.allocCount=", s.allocCount, "s.nelems=", s.nelems)
 			throw("s.allocCount != s.nelems && freeIndex == s.nelems")
 		}
-		c.refill(spc)
+		c.refill(spc) // 這個 mspan 已經沒有可用的 object 了，呼叫 refill 向 mcentral 申請一個新的 mspan 來替換舊的
 		shouldhelpgc = true
 		s = c.alloc[spc]
 
-		freeIndex = s.nextFreeIndex()
+		freeIndex = s.nextFreeIndex() // 從新的 mspan 找出下一個可用的 freeIndex
 	}
 
 	if freeIndex >= s.nelems {
 		throw("freeIndex is not valid")
 	}
 
-	v = gclinkptr(freeIndex*s.elemsize + s.base())
+	v = gclinkptr(freeIndex*s.elemsize + s.base()) // 順利找到可用的 object，計算 object 的位址後回傳
 	s.allocCount++
 	if uintptr(s.allocCount) > s.nelems {
 		println("s.allocCount=", s.allocCount, "s.nelems=", s.nelems)
@@ -861,6 +861,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	noscan := typ == nil || typ.kind&kindNoPointers != 0
 	if size <= maxSmallSize {
 		if noscan && size < maxTinySize {
+			// tiny allocating 流程
 			// Tiny allocator.
 			//
 			// Tiny allocator combines several tiny allocation requests
@@ -892,6 +893,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			// reduces heap size by ~20%.
 			off := c.tinyoffset
 			// Align tiny pointer for required (conservative) alignment.
+			// 根據要分配的 size 對齊 offset
 			if size&7 == 0 {
 				off = round(off, 8)
 			} else if size&3 == 0 {
@@ -899,6 +901,9 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			} else if size&1 == 0 {
 				off = round(off, 2)
 			}
+
+			// 檢查此 mcache 是否有 tiny block
+			// 若有且放的下的話，便放進此 tiny block 並調整 offset 後直接返回 pointer
 			if off+size <= maxTinySize && c.tiny != 0 {
 				// The object fits into existing tiny block.
 				x = unsafe.Pointer(c.tiny + off)
@@ -909,34 +914,37 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 				return x
 			}
 			// Allocate a new maxTinySize block.
-			span := c.alloc[tinySpanClass]
-			v := nextFreeFast(span)
+			span := c.alloc[tinySpanClass] // 目前沒有 tiny block 或是不夠用，便從 mcache 拿出 mspan
+			v := nextFreeFast(span)        // 利用 mspan.allocCache 快裡找出可用的 object
 			if v == 0 {
-				v, _, shouldhelpgc = c.nextFree(tinySpanClass)
+				v, _, shouldhelpgc = c.nextFree(tinySpanClass) // 找不到的話，便試著從整個 mspan 找出可用的 object
 			}
 			x = unsafe.Pointer(v)
 			(*[2]uint64)(x)[0] = 0
 			(*[2]uint64)(x)[1] = 0
 			// See if we need to replace the existing tiny block with the new one
 			// based on amount of remaining free space.
+			// 根據剩餘的空間決定需不需要替換現在的 tiny block
 			if size < c.tinyoffset || c.tiny == 0 {
 				c.tiny = uintptr(x)
 				c.tinyoffset = size
 			}
 			size = maxTinySize
 		} else {
+			// small allocating 流程
+			// 根據要分配的 size 找出合適的 size class
 			var sizeclass uint8
 			if size <= smallSizeMax-8 {
 				sizeclass = size_to_class8[(size+smallSizeDiv-1)/smallSizeDiv]
 			} else {
 				sizeclass = size_to_class128[(size-smallSizeMax+largeSizeDiv-1)/largeSizeDiv]
 			}
-			size = uintptr(class_to_size[sizeclass])
-			spc := makeSpanClass(sizeclass, noscan)
-			span := c.alloc[spc]
-			v := nextFreeFast(span)
+			size = uintptr(class_to_size[sizeclass]) // 將 size round up 為此 class 的 object size
+			spc := makeSpanClass(sizeclass, noscan)  // 根據 size class 及是否能 scan 決定 span class
+			span := c.alloc[spc]                     // 根據 span class 取出 mcache 裡的 mspan
+			v := nextFreeFast(span)                  // 利用 mspan.allocCache 快裡找出可用的 object (回頭看上面的 tiny size 流程)
 			if v == 0 {
-				v, span, shouldhelpgc = c.nextFree(spc)
+				v, span, shouldhelpgc = c.nextFree(spc) // 找不到的話，便試著從整個 mspan 找出可用的 object (回頭看上面的 tiny size 流程)
 			}
 			x = unsafe.Pointer(v)
 			if needzero && span.needzero != 0 {
@@ -944,10 +952,11 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			}
 		}
 	} else {
+		// large allocating 流程
 		var s *mspan
 		shouldhelpgc = true
 		systemstack(func() {
-			s = largeAlloc(size, needzero, noscan)
+			s = largeAlloc(size, needzero, noscan) // 呼叫 largeAlloc
 		})
 		s.freeindex = 1
 		s.allocCount = 1
@@ -1052,7 +1061,7 @@ func largeAlloc(size uintptr, needzero bool, noscan bool) *mspan {
 	// pays the debt down to npage pages.
 	deductSweepCredit(npages*_PageSize, npages)
 
-	s := mheap_.alloc(npages, makeSpanClass(0, noscan), true, needzero)
+	s := mheap_.alloc(npages, makeSpanClass(0, noscan), true, needzero) // 跳過 mcache、mcentral，直接向 mheap 申請 (回頭看上面的 tiny size 流程)
 	if s == nil {
 		throw("out of memory")
 	}

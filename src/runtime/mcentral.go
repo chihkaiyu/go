@@ -18,15 +18,15 @@ import "runtime/internal/atomic"
 //
 //go:notinheap
 type mcentral struct {
-	lock      mutex
-	spanclass spanClass
-	nonempty  mSpanList // list of spans with a free object, ie a nonempty free list
-	empty     mSpanList // list of spans with no free objects (or cached in an mcache)
+	lock      mutex     // 可能同時會有多個 mcache 向 mcentral 要求 mspan，所以需要 lcok
+	spanclass spanClass // 表示此 mcentral 是負責哪個 span class
+	nonempty  mSpanList // 仍有可用 object 的 mspan linked list
+	empty     mSpanList // 無可用 object 的 mspan linked list 或是被 cached 在 mcache 了
 
 	// nmalloc is the cumulative count of objects allocated from
 	// this mcentral, assuming all spans in mcaches are
 	// fully-allocated. Written atomically, read under STW.
-	nmalloc uint64
+	nmalloc uint64 // 此 mcentral 所分配的 object 數量
 }
 
 // Initialize a single central free list.
@@ -42,7 +42,7 @@ func (c *mcentral) cacheSpan() *mspan {
 	spanBytes := uintptr(class_to_allocnpages[c.spanclass.sizeclass()]) * _PageSize
 	deductSweepCredit(spanBytes, 0)
 
-	lock(&c.lock)
+	lock(&c.lock) // mcentral 是共用的，需要 lock
 	traceDone := false
 	if trace.enabled {
 		traceGCSweepStart()
@@ -50,12 +50,14 @@ func (c *mcentral) cacheSpan() *mspan {
 	sg := mheap_.sweepgen
 retry:
 	var s *mspan
+	// 試著在 nonempty mspan linked-list (還有可用 object 的 mspan) 找出可用的 mspan
 	for s = c.nonempty.first; s != nil; s = s.next {
+		// sg-2 代表該 mspan 需要 sweep，試著將他的狀態改成 sg-1，即為該 mspan 正在被 swept
 		if s.sweepgen == sg-2 && atomic.Cas(&s.sweepgen, sg-2, sg-1) {
-			c.nonempty.remove(s)
-			c.empty.insertBack(s)
-			unlock(&c.lock)
-			s.sweep(true)
+			c.nonempty.remove(s)  // 將該 mspan 從 nonempty 移除
+			c.empty.insertBack(s) // 將該 mspan insert 到 empty 的尾巴
+			unlock(&c.lock)       // 找到可用的 mspan 了，可以 unlock mcentral 了
+			s.sweep(true)         // sweep 該 mspan
 			goto havespan
 		}
 		if s.sweepgen == sg-1 {
@@ -63,13 +65,16 @@ retry:
 			continue
 		}
 		// we have a nonempty span that does not require sweeping, allocate from it
+		// 該 mspan 可以直接使用，不需 sweep，直接將他從 nonempty 移除，並 insert 到 empty 的尾巴
 		c.nonempty.remove(s)
 		c.empty.insertBack(s)
 		unlock(&c.lock)
 		goto havespan
 	}
 
+	// 試著在 empty mspan linked-list (已經沒有空間或被 cached 的 mspan) 找出可用的 mspan
 	for s = c.empty.first; s != nil; s = s.next {
+		// 與上面一樣，找出需 sweep 的 mspan 並試著改他的狀態
 		if s.sweepgen == sg-2 && atomic.Cas(&s.sweepgen, sg-2, sg-1) {
 			// we have an empty span that requires sweeping,
 			// sweep it and see if we can free some space in it
@@ -77,7 +82,11 @@ retry:
 			// swept spans are at the end of the list
 			c.empty.insertBack(s)
 			unlock(&c.lock)
+
+			// sweep 該 mspan
 			s.sweep(true)
+
+			// 看看 swept 後的 mspan 的 freeIndex 是否可用
 			freeIndex := s.nextFreeIndex()
 			if freeIndex != s.nelems {
 				s.freeindex = freeIndex
@@ -86,6 +95,8 @@ retry:
 			lock(&c.lock)
 			// the span is still empty after sweep
 			// it is already in the empty list, so just retry
+			// 該 mspan 在 swept 後還是空的，並且已經在 empty 裡了，直接 retry
+			// 這裡我自己也不是很清楚為什麼是直接 retry，而不是繼續檢查 empty list 裡的其他 mspan
 			goto retry
 		}
 		if s.sweepgen == sg-1 {
@@ -94,6 +105,8 @@ retry:
 		}
 		// already swept empty span,
 		// all subsequent ones must also be either swept or in process of sweeping
+		// 上面是原文註解，但我依然不是很清楚為什麼這裡直接 break。
+		// 例如第一個 mspan 是不需要 sweep 的話 (單純滿了)，那便直接 break 不繼續檢查其他 mspan 了嗎？
 		break
 	}
 	if trace.enabled {
@@ -103,7 +116,7 @@ retry:
 	unlock(&c.lock)
 
 	// Replenish central list if empty.
-	s = c.grow()
+	s = c.grow() // 在 nonempty 及 empty 都找不到可用的 mspan，需要向 mheap 申請
 	if s == nil {
 		return nil
 	}
@@ -249,11 +262,12 @@ func (c *mcentral) freeSpan(s *mspan, preserve bool, wasempty bool) bool {
 
 // grow allocates a new empty span from the heap and initializes it for c's size class.
 func (c *mcentral) grow() *mspan {
+	// 根據該 mcentral 的 spanclass 計算要申請的量
 	npages := uintptr(class_to_allocnpages[c.spanclass.sizeclass()])
 	size := uintptr(class_to_size[c.spanclass.sizeclass()])
 	n := (npages << _PageShift) / size
 
-	s := mheap_.alloc(npages, c.spanclass, false, true)
+	s := mheap_.alloc(npages, c.spanclass, false, true) // 向 mheap 申請 mspan 來使用
 	if s == nil {
 		return nil
 	}

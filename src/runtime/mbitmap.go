@@ -195,6 +195,7 @@ func (s *mspan) refillAllocCache(whichByte uintptr) {
 func (s *mspan) nextFreeIndex() uintptr {
 	sfreeindex := s.freeindex
 	snelems := s.nelems
+	// 若目前的 freeIndex 為該 mspan 總可用 object 數量時，代表此 mspan 已無可用的 object 了
 	if sfreeindex == snelems {
 		return sfreeindex
 	}
@@ -204,16 +205,18 @@ func (s *mspan) nextFreeIndex() uintptr {
 
 	aCache := s.allocCache
 
+	// 下面 loop 利用 allocCache 與 freeIndex 來 iterate 整個 mspan 試著找出可用的 object 位置
 	bitIndex := sys.Ctz64(aCache)
-	for bitIndex == 64 {
+	for bitIndex == 64 { // sys.Ctz64 回傳 64 的話，代表 allocCache 裡全部都是 0，代表 allocCache 所涵蓋的部份沒有可用的 object
+		// 將 freeIndex 移到下 8 個 bytes
 		// Move index to start of next cached bits.
 		sfreeindex = (sfreeindex + 64) &^ (64 - 1)
-		if sfreeindex >= snelems {
+		if sfreeindex >= snelems { // freeIndex 若超過此 mspan 總可用 object 數量，表示該 mspan 已無可用的 object
 			s.freeindex = snelems
 			return snelems
 		}
 		whichByte := sfreeindex / 8
-		// Refill s.allocCache with the next 64 alloc bits.
+		// 根據新的 freeIndex 重新填補 allocCache
 		s.refillAllocCache(whichByte)
 		aCache = s.allocCache
 		bitIndex = sys.Ctz64(aCache)
@@ -226,8 +229,8 @@ func (s *mspan) nextFreeIndex() uintptr {
 		return snelems
 	}
 
-	s.allocCache >>= uint(bitIndex + 1)
-	sfreeindex = result + 1
+	s.allocCache >>= uint(bitIndex + 1) // 調整 allocCache
+	sfreeindex = result + 1             // 調整 freeIndex
 
 	if sfreeindex%64 == 0 && sfreeindex != snelems {
 		// We just incremented s.freeindex so it isn't 0.

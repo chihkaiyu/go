@@ -31,9 +31,9 @@ type mcache struct {
 	// tiny is a heap pointer. Since mcache is in non-GC'd memory,
 	// we handle it by clearing it in releaseAll during mark
 	// termination.
-	tiny             uintptr
-	tinyoffset       uintptr
-	local_tinyallocs uintptr // number of tiny allocs not counted in other stats
+	tiny             uintptr // tiny object 的起始位址
+	tinyoffset       uintptr // 從 tiny 開始的 offset，即下次分配 tiny 的地方
+	local_tinyallocs uintptr // tiny object 的數量
 
 	// The rest is not accessed on every malloc.
 
@@ -118,13 +118,14 @@ func freemcache(c *mcache) {
 // c could change.
 func (c *mcache) refill(spc spanClass) {
 	// Return the current cached span to the central lists.
-	s := c.alloc[spc]
+	s := c.alloc[spc] // 取出目前滿載的 mspan
 
 	if uintptr(s.allocCount) != s.nelems {
 		throw("refill of span with free space remaining")
 	}
 	if s != &emptymspan {
 		// Mark this span as no longer cached.
+		// 將此 mspan 標記為不再被 mcache cached
 		if s.sweepgen != mheap_.sweepgen+3 {
 			throw("bad sweepgen in refill")
 		}
@@ -132,7 +133,7 @@ func (c *mcache) refill(spc spanClass) {
 	}
 
 	// Get a new cached span from the central lists.
-	s = mheap_.central[spc].mcentral.cacheSpan()
+	s = mheap_.central[spc].mcentral.cacheSpan() // 從 mcentral 再拿一個新的 mspan
 	if s == nil {
 		throw("out of memory")
 	}
@@ -145,7 +146,7 @@ func (c *mcache) refill(spc spanClass) {
 	// sweeping in the next sweep phase.
 	s.sweepgen = mheap_.sweepgen + 3
 
-	c.alloc[spc] = s
+	c.alloc[spc] = s // 將新的 mspan 放到 mcache 裡
 }
 
 func (c *mcache) releaseAll() {
